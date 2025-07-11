@@ -7,10 +7,19 @@
 (define-constant ERR_STORY_NOT_FUNDED (err u105))
 (define-constant ERR_INVALID_AMOUNT (err u106))
 (define-constant ERR_STORY_ALREADY_PUBLISHED (err u107))
+(define-constant ERR_MILESTONE_NOT_FOUND (err u108))
+(define-constant ERR_MILESTONE_ALREADY_COMPLETED (err u109))
+(define-constant ERR_MILESTONE_NOT_READY (err u110))
+(define-constant ERR_INSUFFICIENT_MILESTONE_VOTES (err u111))
+(define-constant ERR_MILESTONE_DEADLINE_PASSED (err u112))
+(define-constant ERR_INVALID_MILESTONE_INDEX (err u113))
+(define-constant ERR_MILESTONE_ALREADY_APPROVED (err u114))
 
 (define-data-var story-counter uint u0)
 (define-data-var min-funding-amount uint u1000000)
 (define-data-var voting-period uint u144)
+(define-data-var milestone-voting-period uint u72)
+(define-data-var min-milestone-approval-percentage uint u60)
 
 (define-map stories
   { story-id: uint }
@@ -26,8 +35,32 @@
     voting-ends-at: uint,
     is-funded: bool,
     is-published: bool,
-    content-hash: (optional (string-ascii 64))
+    content-hash: (optional (string-ascii 64)),
+    milestone-count: uint,
+    milestone-funds-released: uint
   }
+)
+
+(define-map story-milestones
+  { story-id: uint, milestone-index: uint }
+  {
+    title: (string-ascii 100),
+    description: (string-ascii 300),
+    funding-percentage: uint,
+    deadline: uint,
+    evidence-hash: (optional (string-ascii 64)),
+    is-completed: bool,
+    is-approved: bool,
+    approval-votes: uint,
+    rejection-votes: uint,
+    voting-deadline: uint,
+    funds-released: uint
+  }
+)
+
+(define-map milestone-voters
+  { story-id: uint, milestone-index: uint, voter: principal }
+  { vote: bool, voted-at: uint }
 )
 
 (define-map story-funders
@@ -66,7 +99,9 @@
         voting-ends-at: (+ current-block (var-get voting-period)),
         is-funded: false,
         is-published: false,
-        content-hash: none
+        content-hash: none,
+        milestone-count: u0,
+        milestone-funds-released: u0
       }
     )
     (var-set story-counter story-id)
@@ -214,6 +249,154 @@
   )
 )
 
+(define-public (create-milestone (story-id uint) (title (string-ascii 100)) (description (string-ascii 300)) (funding-percentage uint) (deadline-blocks uint))
+  (let
+    (
+      (story (unwrap! (map-get? stories { story-id: story-id }) ERR_STORY_NOT_FOUND))
+      (current-block stacks-block-height)
+      (milestone-index (get milestone-count story))
+    )
+    (asserts! (is-eq tx-sender (get journalist story)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get is-published story)) ERR_STORY_ALREADY_PUBLISHED)
+    (asserts! (and (> funding-percentage u0) (<= funding-percentage u100)) ERR_INVALID_AMOUNT)
+    (asserts! (> deadline-blocks u0) ERR_INVALID_AMOUNT)
+    (map-set story-milestones
+      { story-id: story-id, milestone-index: milestone-index }
+      {
+        title: title,
+        description: description,
+        funding-percentage: funding-percentage,
+        deadline: (+ current-block deadline-blocks),
+        evidence-hash: none,
+        is-completed: false,
+        is-approved: false,
+        approval-votes: u0,
+        rejection-votes: u0,
+        voting-deadline: u0,
+        funds-released: u0
+      }
+    )
+    (map-set stories
+      { story-id: story-id }
+      (merge story { milestone-count: (+ milestone-index u1) })
+    )
+    (ok milestone-index)
+  )
+)
+
+(define-public (submit-milestone-evidence (story-id uint) (milestone-index uint) (evidence-hash (string-ascii 64)))
+  (let
+    (
+      (story (unwrap! (map-get? stories { story-id: story-id }) ERR_STORY_NOT_FOUND))
+      (milestone (unwrap! (map-get? story-milestones { story-id: story-id, milestone-index: milestone-index }) ERR_MILESTONE_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get journalist story)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-funded story) ERR_STORY_NOT_FUNDED)
+    (asserts! (not (get is-completed milestone)) ERR_MILESTONE_ALREADY_COMPLETED)
+    (asserts! (<= current-block (get deadline milestone)) ERR_MILESTONE_DEADLINE_PASSED)
+    (map-set story-milestones
+      { story-id: story-id, milestone-index: milestone-index }
+      (merge milestone {
+        evidence-hash: (some evidence-hash),
+        is-completed: true,
+        voting-deadline: (+ current-block (var-get milestone-voting-period))
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (vote-on-milestone (story-id uint) (milestone-index uint) (approve bool))
+  (let
+    (
+      (story (unwrap! (map-get? stories { story-id: story-id }) ERR_STORY_NOT_FOUND))
+      (milestone (unwrap! (map-get? story-milestones { story-id: story-id, milestone-index: milestone-index }) ERR_MILESTONE_NOT_FOUND))
+      (current-block stacks-block-height)
+      (funder-contribution (unwrap! (map-get? story-funders { story-id: story-id, funder: tx-sender }) ERR_NOT_AUTHORIZED))
+    )
+    (asserts! (get is-completed milestone) ERR_MILESTONE_NOT_READY)
+    (asserts! (<= current-block (get voting-deadline milestone)) ERR_VOTING_ENDED)
+    (asserts! (is-none (map-get? milestone-voters { story-id: story-id, milestone-index: milestone-index, voter: tx-sender })) ERR_ALREADY_VOTED)
+    (let
+      (
+        (voter-weight (get amount funder-contribution))
+        (new-approval-votes (if approve (+ (get approval-votes milestone) voter-weight) (get approval-votes milestone)))
+        (new-rejection-votes (if approve (get rejection-votes milestone) (+ (get rejection-votes milestone) voter-weight)))
+      )
+      (map-set story-milestones
+        { story-id: story-id, milestone-index: milestone-index }
+        (merge milestone {
+          approval-votes: new-approval-votes,
+          rejection-votes: new-rejection-votes
+        })
+      )
+      (map-set milestone-voters
+        { story-id: story-id, milestone-index: milestone-index, voter: tx-sender }
+        { vote: approve, voted-at: current-block }
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (release-milestone-funds (story-id uint) (milestone-index uint))
+  (let
+    (
+      (story (unwrap! (map-get? stories { story-id: story-id }) ERR_STORY_NOT_FOUND))
+      (milestone (unwrap! (map-get? story-milestones { story-id: story-id, milestone-index: milestone-index }) ERR_MILESTONE_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (get is-completed milestone) ERR_MILESTONE_NOT_READY)
+    (asserts! (> current-block (get voting-deadline milestone)) ERR_VOTING_ENDED)
+    (asserts! (not (get is-approved milestone)) ERR_MILESTONE_ALREADY_APPROVED)
+    (let
+      (
+        (total-votes (+ (get approval-votes milestone) (get rejection-votes milestone)))
+        (approval-percentage (if (> total-votes u0) (/ (* (get approval-votes milestone) u100) total-votes) u0))
+        (milestone-passed (>= approval-percentage (var-get min-milestone-approval-percentage)))
+      )
+      (asserts! milestone-passed ERR_INSUFFICIENT_MILESTONE_VOTES)
+      (let
+        (
+          (milestone-amount (/ (* (get current-funding story) (get funding-percentage milestone)) u100))
+          (journalist (get journalist story))
+        )
+        (map-set story-milestones
+          { story-id: story-id, milestone-index: milestone-index }
+          (merge milestone {
+            is-approved: true,
+            funds-released: milestone-amount
+          })
+        )
+        (map-set stories
+          { story-id: story-id }
+          (merge story { milestone-funds-released: (+ (get milestone-funds-released story) milestone-amount) })
+        )
+        (try! (as-contract (stx-transfer? milestone-amount tx-sender journalist)))
+        (ok milestone-amount)
+      )
+    )
+  )
+)
+
+(define-public (set-milestone-voting-period (blocks uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set milestone-voting-period blocks)
+    (ok true)
+  )
+)
+
+(define-public (set-min-milestone-approval-percentage (percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (and (>= percentage u0) (<= percentage u100)) ERR_INVALID_AMOUNT)
+    (var-set min-milestone-approval-percentage percentage)
+    (ok true)
+  )
+)
+
 (define-read-only (get-story (story-id uint))
   (map-get? stories { story-id: story-id })
 )
@@ -240,6 +423,48 @@
 
 (define-read-only (get-voting-period)
   (var-get voting-period)
+)
+
+(define-read-only (get-milestone-voting-period)
+  (var-get milestone-voting-period)
+)
+
+(define-read-only (get-min-milestone-approval-percentage)
+  (var-get min-milestone-approval-percentage)
+)
+
+(define-read-only (get-story-milestone (story-id uint) (milestone-index uint))
+  (map-get? story-milestones { story-id: story-id, milestone-index: milestone-index })
+)
+
+(define-read-only (get-milestone-vote (story-id uint) (milestone-index uint) (voter principal))
+  (map-get? milestone-voters { story-id: story-id, milestone-index: milestone-index, voter: voter })
+)
+
+(define-read-only (get-milestone-status (story-id uint) (milestone-index uint))
+  (match (map-get? story-milestones { story-id: story-id, milestone-index: milestone-index })
+    milestone
+    (let
+      (
+        (current-block stacks-block-height)
+        (deadline-passed (> current-block (get deadline milestone)))
+        (voting-ended (> current-block (get voting-deadline milestone)))
+        (total-votes (+ (get approval-votes milestone) (get rejection-votes milestone)))
+        (approval-percentage (if (> total-votes u0) (/ (* (get approval-votes milestone) u100) total-votes) u0))
+        (vote-passed (>= approval-percentage (var-get min-milestone-approval-percentage)))
+      )
+      (ok {
+        is-completed: (get is-completed milestone),
+        is-approved: (get is-approved milestone),
+        deadline-passed: deadline-passed,
+        voting-ended: voting-ended,
+        vote-passed: vote-passed,
+        approval-percentage: approval-percentage,
+        can-release-funds: (and (get is-completed milestone) voting-ended vote-passed (not (get is-approved milestone)))
+      })
+    )
+    ERR_MILESTONE_NOT_FOUND
+  )
 )
 
 (define-read-only (get-story-status (story-id uint))
