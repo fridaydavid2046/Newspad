@@ -14,12 +14,20 @@
 (define-constant ERR_MILESTONE_DEADLINE_PASSED (err u112))
 (define-constant ERR_INVALID_MILESTONE_INDEX (err u113))
 (define-constant ERR_MILESTONE_ALREADY_APPROVED (err u114))
+(define-constant ERR_SUBSCRIPTION_NOT_FOUND (err u115))
+(define-constant ERR_SUBSCRIPTION_EXPIRED (err u116))
+(define-constant ERR_INSUFFICIENT_ACCESS_LEVEL (err u117))
+(define-constant ERR_CONTENT_NOT_FOUND (err u118))
+(define-constant ERR_INVALID_SUBSCRIPTION_TIER (err u119))
+(define-constant ERR_SUBSCRIPTION_ALREADY_ACTIVE (err u120))
 
 (define-data-var story-counter uint u0)
 (define-data-var min-funding-amount uint u1000000)
 (define-data-var voting-period uint u144)
 (define-data-var milestone-voting-period uint u72)
 (define-data-var min-milestone-approval-percentage uint u60)
+(define-data-var subscription-tier-counter uint u0)
+(define-data-var premium-content-counter uint u0)
 
 (define-map stories
   { story-id: uint }
@@ -76,6 +84,47 @@
 (define-map journalist-reputation
   { journalist: principal }
   { stories-published: uint, total-funding-received: uint }
+)
+
+(define-map subscription-tiers
+  { tier-id: uint }
+  {
+    journalist: principal,
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    monthly-price: uint,
+    access-level: uint,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-map subscriber-memberships
+  { subscriber: principal, tier-id: uint }
+  {
+    subscribed-at: uint,
+    expires-at: uint,
+    is-active: bool,
+    total-paid: uint
+  }
+)
+
+(define-map premium-content
+  { content-id: uint }
+  {
+    journalist: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 300),
+    content-hash: (string-ascii 64),
+    required-access-level: uint,
+    created-at: uint,
+    is-published: bool
+  }
+)
+
+(define-map content-access-log
+  { content-id: uint, subscriber: principal }
+  { accessed-at: uint, tier-used: uint }
 )
 
 (define-public (propose-story (title (string-ascii 100)) (description (string-ascii 500)) (funding-goal uint))
@@ -488,3 +537,209 @@
     ERR_STORY_NOT_FOUND
   )
 )
+
+(define-public (create-subscription-tier (name (string-ascii 50)) (description (string-ascii 200)) (monthly-price uint) (access-level uint))
+  (let
+    (
+      (tier-id (+ (var-get subscription-tier-counter) u1))
+      (current-block stacks-block-height)
+    )
+    (asserts! (> monthly-price u0) ERR_INVALID_AMOUNT)
+    (asserts! (and (> access-level u0) (<= access-level u5)) ERR_INVALID_SUBSCRIPTION_TIER)
+    (map-set subscription-tiers
+      { tier-id: tier-id }
+      {
+        journalist: tx-sender,
+        name: name,
+        description: description,
+        monthly-price: monthly-price,
+        access-level: access-level,
+        is-active: true,
+        created-at: current-block
+      }
+    )
+    (var-set subscription-tier-counter tier-id)
+    (ok tier-id)
+  )
+)
+
+(define-public (subscribe-to-tier (tier-id uint) (months uint))
+  (let
+    (
+      (tier (unwrap! (map-get? subscription-tiers { tier-id: tier-id }) ERR_SUBSCRIPTION_NOT_FOUND))
+      (current-block stacks-block-height)
+      (total-cost (* (get monthly-price tier) months))
+      (blocks-per-month u4320)
+      (subscription-duration (* months blocks-per-month))
+      (existing-membership (map-get? subscriber-memberships { subscriber: tx-sender, tier-id: tier-id }))
+    )
+    (asserts! (get is-active tier) ERR_SUBSCRIPTION_NOT_FOUND)
+    (asserts! (> months u0) ERR_INVALID_AMOUNT)
+    (asserts! (> total-cost u0) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? total-cost tx-sender (get journalist tier)))
+    (let
+      (
+        (new-expires-at (+ current-block subscription-duration))
+        (existing-total (default-to u0 (get total-paid existing-membership)))
+      )
+      (map-set subscriber-memberships
+        { subscriber: tx-sender, tier-id: tier-id }
+        {
+          subscribed-at: current-block,
+          expires-at: new-expires-at,
+          is-active: true,
+          total-paid: (+ existing-total total-cost)
+        }
+      )
+      (ok new-expires-at)
+    )
+  )
+)
+
+(define-public (create-premium-content (title (string-ascii 100)) (description (string-ascii 300)) (content-hash (string-ascii 64)) (required-access-level uint))
+  (let
+    (
+      (content-id (+ (var-get premium-content-counter) u1))
+      (current-block stacks-block-height)
+    )
+    (asserts! (and (> required-access-level u0) (<= required-access-level u5)) ERR_INVALID_SUBSCRIPTION_TIER)
+    (map-set premium-content
+      { content-id: content-id }
+      {
+        journalist: tx-sender,
+        title: title,
+        description: description,
+        content-hash: content-hash,
+        required-access-level: required-access-level,
+        created-at: current-block,
+        is-published: true
+      }
+    )
+    (var-set premium-content-counter content-id)
+    (ok content-id)
+  )
+)
+
+(define-public (access-premium-content (content-id uint) (tier-id uint))
+  (let
+    (
+      (content (unwrap! (map-get? premium-content { content-id: content-id }) ERR_CONTENT_NOT_FOUND))
+      (tier (unwrap! (map-get? subscription-tiers { tier-id: tier-id }) ERR_SUBSCRIPTION_NOT_FOUND))
+      (membership (unwrap! (map-get? subscriber-memberships { subscriber: tx-sender, tier-id: tier-id }) ERR_SUBSCRIPTION_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (get is-published content) ERR_CONTENT_NOT_FOUND)
+    (asserts! (get is-active membership) ERR_SUBSCRIPTION_EXPIRED)
+    (asserts! (> (get expires-at membership) current-block) ERR_SUBSCRIPTION_EXPIRED)
+    (asserts! (>= (get access-level tier) (get required-access-level content)) ERR_INSUFFICIENT_ACCESS_LEVEL)
+    (map-set content-access-log
+      { content-id: content-id, subscriber: tx-sender }
+      { accessed-at: current-block, tier-used: tier-id }
+    )
+    (ok (get content-hash content))
+  )
+)
+
+(define-public (cancel-subscription (tier-id uint))
+  (let
+    (
+      (membership (unwrap! (map-get? subscriber-memberships { subscriber: tx-sender, tier-id: tier-id }) ERR_SUBSCRIPTION_NOT_FOUND))
+    )
+    (asserts! (get is-active membership) ERR_SUBSCRIPTION_NOT_FOUND)
+    (map-set subscriber-memberships
+      { subscriber: tx-sender, tier-id: tier-id }
+      (merge membership { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (deactivate-subscription-tier (tier-id uint))
+  (let
+    (
+      (tier (unwrap! (map-get? subscription-tiers { tier-id: tier-id }) ERR_SUBSCRIPTION_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get journalist tier)) ERR_NOT_AUTHORIZED)
+    (map-set subscription-tiers
+      { tier-id: tier-id }
+      (merge tier { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-tier-pricing (tier-id uint) (new-monthly-price uint))
+  (let
+    (
+      (tier (unwrap! (map-get? subscription-tiers { tier-id: tier-id }) ERR_SUBSCRIPTION_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get journalist tier)) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-monthly-price u0) ERR_INVALID_AMOUNT)
+    (map-set subscription-tiers
+      { tier-id: tier-id }
+      (merge tier { monthly-price: new-monthly-price })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-subscription-tier (tier-id uint))
+  (map-get? subscription-tiers { tier-id: tier-id })
+)
+
+(define-read-only (get-subscriber-membership (subscriber principal) (tier-id uint))
+  (map-get? subscriber-memberships { subscriber: subscriber, tier-id: tier-id })
+)
+
+(define-read-only (get-premium-content (content-id uint))
+  (map-get? premium-content { content-id: content-id })
+)
+
+(define-read-only (get-content-access-log (content-id uint) (subscriber principal))
+  (map-get? content-access-log { content-id: content-id, subscriber: subscriber })
+)
+
+(define-read-only (get-subscription-tier-counter)
+  (var-get subscription-tier-counter)
+)
+
+(define-read-only (get-premium-content-counter)
+  (var-get premium-content-counter)
+)
+
+(define-read-only (is-subscription-active (subscriber principal) (tier-id uint))
+  (match (map-get? subscriber-memberships { subscriber: subscriber, tier-id: tier-id })
+    membership
+    (let
+      (
+        (current-block stacks-block-height)
+      )
+      (and 
+        (get is-active membership)
+        (> (get expires-at membership) current-block)
+      )
+    )
+    false
+  )
+)
+
+(define-read-only (can-access-content (subscriber principal) (content-id uint) (tier-id uint))
+  (match (map-get? premium-content { content-id: content-id })
+    content
+    (match (map-get? subscription-tiers { tier-id: tier-id })
+      tier
+      (let
+        (
+          (has-active-subscription (is-subscription-active subscriber tier-id))
+          (sufficient-access-level (>= (get access-level tier) (get required-access-level content)))
+        )
+        (and has-active-subscription sufficient-access-level)
+      )
+      false
+    )
+    false
+  )
+)
+
+
+
